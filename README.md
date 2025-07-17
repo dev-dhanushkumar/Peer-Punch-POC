@@ -31,8 +31,8 @@ A simple peer-to-peer (P2P) chat application written in Rust that demonstrates U
 Clone the repository and build the project:
 
 ```bash
-git clone https://github.com/your-username/Peer-Punch.git
-cd Peer-Punch
+git clone https://github.com/dev-dhanushkumar/Peer-Punch-POC/
+cd Peer-Punch-POC
 cargo build
 ```
 
