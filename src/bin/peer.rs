@@ -7,6 +7,8 @@ use tokio::io::{self, AsyncBufReadExt, BufReader};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 
+use std::env;
+
 struct Peer {
     username: String,
     socket: Arc<UdpSocket>,
@@ -16,14 +18,14 @@ struct Peer {
 }
 
 impl Peer {
-    async fn new(username: String, relay_addr: &str) -> Result<Self> {
-        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    async fn new(username: String, relay_addr: SocketAddr) -> Result<Self> {
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
         log::info!("Peer listening on {}", socket.local_addr()?);
         let (tx, rx) = watch::channel(None);
         Ok(Self {
             username,
             socket: Arc::new(socket),
-            relay_addr: relay_addr.parse()?,
+            relay_addr,
             other_peer_rx: rx,
             other_peer_tx: tx,
         })
@@ -195,9 +197,23 @@ impl Peer {
     }
 }
 
+use tokio::net::lookup_host;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
+
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 2 {
+        eprintln!("Usage: {} <relay_server_addr>", args[0]);
+        return Ok(());
+    }
+    let relay_addr_str = args[1].strip_prefix("https://").unwrap_or(&args[1]);
+
+    let relay_addr = lookup_host(relay_addr_str)
+        .await?
+        .find(|addr| addr.is_ipv4())
+        .ok_or_else(|| anyhow::anyhow!("Could not resolve relay server address to an IPv4 address"))?;
 
     println!("Please enter your username:");
     let mut username = String::new();
@@ -205,6 +221,6 @@ async fn main() -> Result<()> {
     reader.read_line(&mut username).await?;
     let username = username.trim().to_string();
 
-    let mut peer = Peer::new(username, "127.0.0.1:8080").await?;
+    let mut peer = Peer::new(username, relay_addr).await?;
     peer.run().await
 }
