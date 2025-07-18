@@ -1,5 +1,6 @@
 use anyhow::Result;
 use peer_punch::Message;
+use proxy_header::{ProxyHeader, ParseConfig};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
@@ -34,8 +35,26 @@ impl RelayServer {
     async fn run(&mut self) -> Result<()> {
         let mut buf = [0; 1024];
         loop {
-            let (len, addr) = self.socket.recv_from(&mut buf).await?;
-            let message: Message = serde_json::from_slice(&buf[..len])?;
+            let (len, mut addr) = self.socket.recv_from(&mut buf).await?;
+            let mut data = &buf[..len];
+
+            // Attempt to parse PROXY protocol header
+            if let Ok((header, header_len)) = ProxyHeader::parse(data, ParseConfig::default()) {
+                if let Some(proxied_addr) = header.proxied_address() {
+                     log::info!("Parsed PROXY protocol header. Original source: {}", proxied_addr.source);
+                    addr = proxied_addr.source;
+                }
+               
+                data = &data[header_len..];
+            }
+
+            let message: Message = match serde_json::from_slice(data) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    log::error!("Failed to deserialize message from {}: {}", addr, e);
+                    continue;
+                }
+            };
             log::info!("Received message from {}: {:?}", addr, message);
 
             // Get the username from the message to identify the peer
