@@ -1,20 +1,26 @@
 use anyhow::Result;
 use peer_punch::Message;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Mutex};
 use stunclient::StunClient;
 
 use std::env;
 
-// We need to track if we have a direct connection
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ConnectionStatus {
     Relayed,
     Direct,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PeerSessionStatus {
+    Idle,
+    Connecting,
+    InChat,
 }
 
 struct Peer {
@@ -25,6 +31,7 @@ struct Peer {
     other_peer_rx: watch::Receiver<Option<(SocketAddr, String)>>,
     other_peer_tx: watch::Sender<Option<(SocketAddr, String)>>,
     connection_status: Arc<Mutex<ConnectionStatus>>,
+    session_status: Arc<Mutex<PeerSessionStatus>>,
 }
 
 impl Peer {
@@ -39,35 +46,55 @@ impl Peer {
             other_peer_rx: rx,
             other_peer_tx: tx,
             connection_status: Arc::new(Mutex::new(ConnectionStatus::Relayed)),
+            session_status: Arc::new(Mutex::new(PeerSessionStatus::Idle)),
         })
     }
 
     async fn run(&mut self) -> Result<()> {
         self.register().await?;
-
-        println!("Enter the username of the peer you want to connect to: ");
-        let mut target_username = String::new();
-        let mut reader = BufReader::new(io::stdin());
-        reader.read_line(&mut target_username).await?;
-        let target_username = target_username.trim().to_string();
-        self.connect_to_peer(target_username).await?;
-
-        let (tx, mut rx) = mpsc::channel(10);
-
-        self.spawn_input_handler(tx);
         self.spawn_network_handler();
         self.spawn_keep_alive_handler();
 
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                self.shutdown().await?;
-            }
-            _ = async {
-                while let Some(line) = rx.recv().await {
-                    self.send_message(line).await?;
+        println!("Ready to connect. Enter a username to connect to, or wait for an incoming connection.");
+
+        let mut reader = BufReader::new(io::stdin());
+        let (tx, mut rx) = mpsc::channel(100);
+
+        // Spawn a task to read from stdin
+        let input_tx = tx.clone();
+        tokio::spawn(async move {
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    if input_tx.send(line).await.is_err() {
+                        break;
+                    }
+                } else {
+                    break;
                 }
-                Result::<(), anyhow::Error>::Ok(())
-            } => {}
+            }
+        });
+
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    self.shutdown().await?;
+                    break;
+                }
+                Some(line) = rx.recv() => {
+                    let current_session_status = *self.session_status.lock().await;
+                    if current_session_status == PeerSessionStatus::InChat {
+                        self.send_message(line.trim().to_string()).await?;
+                    } else if current_session_status == PeerSessionStatus::Idle {
+                        let target_username = line.trim().to_string();
+                        if !target_username.is_empty() {
+                            self.connect_to_peer(target_username).await?;
+                        }
+                    } else {
+                        log::warn!("In the process of connecting, please wait...");
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -84,6 +111,13 @@ impl Peer {
     }
 
     async fn connect_to_peer(&self, target_username: String) -> Result<()> {
+        let mut session_status = self.session_status.lock().await;
+        if *session_status != PeerSessionStatus::Idle {
+            log::warn!("Cannot connect while already in a session or connecting.");
+            return Ok(());
+        }
+        *session_status = PeerSessionStatus::Connecting;
+
         let connect_msg = serde_json::to_vec(&Message::Connect {
             from_username: self.username.clone(),
             target_username,
@@ -94,8 +128,10 @@ impl Peer {
     }
 
     async fn send_message(&self, content: String) -> Result<()> {
-        let status = *self.connection_status.lock().unwrap();
-        if let Some((peer_addr, target_username)) = &*self.other_peer_rx.borrow() {
+        let status = *self.connection_status.lock().await;
+        let other_peer = self.other_peer_rx.borrow().clone();
+
+        if let Some((peer_addr, target_username)) = other_peer {
             let msg = if status == ConnectionStatus::Direct {
                 log::info!("Sending direct message to {}", peer_addr);
                 Message::DirectMessage { content }
@@ -110,7 +146,7 @@ impl Peer {
 
             let msg_bytes = serde_json::to_vec(&msg)?;
             let addr = if status == ConnectionStatus::Direct {
-                *peer_addr
+                peer_addr
             } else {
                 self.relay_addr
             };
@@ -132,28 +168,30 @@ impl Peer {
         Ok(())
     }
 
-    fn spawn_input_handler(&self, tx: mpsc::Sender<String>) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(io::stdin());
-            let mut line = String::new();
-            while reader.read_line(&mut line).await.unwrap() > 0 {
-                tx.send(line.trim().to_string()).await.unwrap();
-                line.clear();
-            }
-        })
-    }
-
     fn spawn_network_handler(&self) -> tokio::task::JoinHandle<()> {
         let socket_clone = self.socket.clone();
         let other_peer_tx = self.other_peer_tx.clone();
-        let _relay_addr = self.relay_addr;
         let connection_status = self.connection_status.clone();
+        let session_status = self.session_status.clone();
 
         tokio::spawn(async move {
             let mut buf = [0; 1024];
             loop {
-                let (len, addr) = socket_clone.recv_from(&mut buf).await.unwrap();
-                let message: Message = serde_json::from_slice(&buf[..len]).unwrap();
+                let (len, addr) = match socket_clone.recv_from(&mut buf).await {
+                    Ok(res) => res,
+                    Err(e) => {
+                        log::error!("Error receiving from socket: {}", e);
+                        continue;
+                    }
+                };
+                let message: Message = match serde_json::from_slice(&buf[..len]) {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        log::warn!("Failed to deserialize message from {}: {}", addr, e);
+                        continue;
+                    }
+                };
+
                 log::info!("Received message from {}: {:?}", addr, message);
 
                 match message {
@@ -161,10 +199,19 @@ impl Peer {
                         log::info!("Successfully registered with relay server.");
                     }
                     Message::PeerInfo { peer, username } => {
-                        log::info!("Received peer info for {}: {}. Sending punch.", username, peer);
+                        let mut sess_status = session_status.lock().await;
+                        if *sess_status == PeerSessionStatus::InChat {
+                            log::warn!("Ignoring PeerInfo, already in a chat.");
+                            continue;
+                        }
+                        *sess_status = PeerSessionStatus::InChat;
+
+                        println!("---");
+                        println!("Connected to {}. You can now chat.", username);
+                        println!("---");
+
                         other_peer_tx.send(Some((peer, username.clone()))).unwrap();
                         
-                        // Punch a hole to the peer's public address
                         let punch_msg = serde_json::to_vec(&Message::Ping).unwrap();
                         socket_clone.send_to(&punch_msg, peer).await.unwrap();
                     }
@@ -182,20 +229,27 @@ impl Peer {
                     }
                     Message::Pong => {
                         log::info!("Received pong from {}. Connection is now DIRECT.", addr);
-                        let mut status = connection_status.lock().unwrap();
-                        *status = ConnectionStatus::Direct;
+                        let mut status = connection_status.lock().await;
+                        if *status != ConnectionStatus::Direct {
+                            *status = ConnectionStatus::Direct;
+                            println!("--- Connection is now Direct ---");
+                        }
                     }
                     Message::Goodbye => {
                         if let Some((_, ref username)) = *other_peer_tx.borrow() {
                             println!("[{}] has left the chat.", username);
                         }
                         other_peer_tx.send(None).unwrap();
+                        *session_status.lock().await = PeerSessionStatus::Idle;
+                        *connection_status.lock().await = ConnectionStatus::Relayed;
                     }
                     Message::TargetNotFound => {
                         println!("Target user not found.");
+                        *session_status.lock().await = PeerSessionStatus::Idle;
                     }
                     Message::TargetBusy => {
                         println!("Target user is busy.");
+                        *session_status.lock().await = PeerSessionStatus::Idle;
                     }
                     _ => {}
                 }
@@ -205,26 +259,27 @@ impl Peer {
 
     fn spawn_keep_alive_handler(&self) -> tokio::task::JoinHandle<()> {
         let socket_clone = self.socket.clone();
-        let mut other_peer_rx = self.other_peer_rx.clone();
+        let other_peer_rx = self.other_peer_rx.clone();
         let connection_status = self.connection_status.clone();
 
         tokio::spawn(async move {
             loop {
-                // Wait until we have a peer
-                if other_peer_rx.borrow().is_none() {
-                    other_peer_rx.changed().await.unwrap();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+
+                let peer_info = other_peer_rx.borrow().clone();
+                if peer_info.is_none() {
                     continue;
                 }
                 
-                let (peer_addr, _) = other_peer_rx.borrow().clone().unwrap();
-                
-                tokio::time::sleep(Duration::from_secs(5)).await;
-
-                let status = *connection_status.lock().unwrap();
-                if status == ConnectionStatus::Direct {
-                    log::info!("Sending direct ping to {}", peer_addr);
-                    let ping = serde_json::to_vec(&Message::Ping).unwrap();
-                    socket_clone.send_to(&ping, peer_addr).await.unwrap();
+                if let Some((peer_addr, _)) = peer_info {
+                    let status = *connection_status.lock().await;
+                    if status == ConnectionStatus::Direct {
+                        log::info!("Sending direct ping to {}", peer_addr);
+                        let ping = serde_json::to_vec(&Message::Ping).unwrap();
+                        if let Err(e) = socket_clone.send_to(&ping, peer_addr).await {
+                            log::error!("Failed to send keep-alive ping: {}", e);
+                        }
+                    }
                 }
             }
         })
