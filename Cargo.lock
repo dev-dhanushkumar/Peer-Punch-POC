@@ -220,6 +220,7 @@ dependencies = [
  "anyhow",
  "env_logger",
  "log",
+ "proxy-header",
  "serde",
  "serde_json",
  "tokio",
@@ -239,6 +240,12 @@ checksum = "02b3e5e68a3a1a02aad3ec490a98007cbc13c37cbe84a3cd7b8e406d76e7f778"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "proxy-header"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc1493f63ddddfba840c3169e997c2905d09538ace72d64e84af6324c6e0e065"
 
 [[package]]
 name = "quote"
