@@ -170,7 +170,7 @@ impl Peer {
                     }
                     Message::DirectMessage { content } => {
                         if let Some((_, ref username)) = *other_peer_tx.borrow() {
-                            println!("[{}]> {}", username, content);
+                            println!("[{}] (Direct)> {}", username, content);
                         }
                     }
                     Message::Ping => {
